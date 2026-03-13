@@ -7,7 +7,7 @@ If you have multiple ChatGPT, Claude, Copilot, or other subscription accounts, t
 ## Install
 
 ```bash
-pi install git:github.com/hjanuschka/multi-pass
+pi install git:github.com/hjanuschka/pi-multi-pass
 ```
 
 ## Usage
