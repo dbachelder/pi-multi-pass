@@ -1,0 +1,25 @@
+{
+  "name": "pi-multi-pass",
+  "version": "1.0.0",
+  "description": "Multi-subscription extension for pi -- use multiple OAuth accounts per provider (Anthropic, Codex, Copilot, Gemini, Antigravity)",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "multi-subscription",
+    "oauth",
+    "codex",
+    "anthropic",
+    "copilot"
+  ],
+  "license": "MIT",
+  "author": "hjanuschka",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hjanuschka/multi-pass"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
