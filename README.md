@@ -1,6 +1,6 @@
 # pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation.
+Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
 ## Install
 
@@ -18,9 +18,9 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
+- **Project affinity**: Restrict which subs/pools are used per project
 - **TUI management**: `/subs` and `/pool` commands -- no config files needed
 - **Labels**: Tag subscriptions (e.g. "work", "personal")
-- **Status tracking**: Token expiry, pool health, auth state
 
 ## Quick start
 
@@ -30,7 +30,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /pool create           Group subs into a rotation pool
 ```
 
-That's it. When one account hits a rate limit, multi-pass automatically switches to the next and retries.
+When one account hits a rate limit, multi-pass automatically switches to the next and retries.
 
 ## Commands
 
@@ -55,33 +55,66 @@ That's it. When one account hits a rate limit, multi-pass automatically switches
 /pool toggle       Enable/disable a pool
 /pool remove       Delete a pool (keeps subscriptions)
 /pool status       Member health (logged in, rate limited, cooling down)
+/pool project      Project-level config (restrict subs, override pools)
 ```
 
-## How pools work
+## Project-level configuration
 
-A pool groups multiple subscriptions of the same provider type for automatic failover:
+Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
+
+### Use case: separate work and personal accounts
+
+```
+# Global: you have 3 Codex accounts
+/subs add   -> openai-codex-2 (label: work)
+/subs add   -> openai-codex-3 (label: personal)
+
+# Corp project: restrict to team accounts only
+cd ~/work/corp-project
+/pool project -> restrict -> select openai-codex-2 only
+
+# Side project: allow everything (no restriction)
+cd ~/side-project
+# No .pi/multi-pass.json needed -- uses all global subs
+```
+
+### What project config can do
+
+| Feature | Description |
+|---|---|
+| **Restrict subs** | Only allow specific subscriptions in this project |
+| **Override pools** | Use different pools than global (or disable some) |
+| **Clear** | Remove project config, fall back to global |
+| **Info** | Show effective config (which pools/subs are active) |
+
+### Project config file
+
+`.pi/multi-pass.json`:
+
+```json
+{
+  "allowedSubs": ["openai-codex-2", "anthropic-2"],
+  "pools": [
+    {
+      "name": "work-codex",
+      "baseProvider": "openai-codex",
+      "members": ["openai-codex-2"],
+      "enabled": true
+    }
+  ]
+}
+```
+
+- `allowedSubs`: whitelist of provider names. If set, only these (plus originals) are available. Omit to allow all.
+- `pools`: if set, replaces global pools for this project. Omit to inherit global pools.
+
+## How pools work
 
 1. You're using `openai-codex` and hit a rate limit
 2. Multi-pass detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
 4. Retries your last prompt automatically
 5. After a 5-minute cooldown, `openai-codex` becomes available again
-
-```
-/subs add          -> openai-codex-2
-/subs add          -> openai-codex-3
-/pool create       -> "codex-pool" with [openai-codex, openai-codex-2, openai-codex-3]
-```
-
-Pool status shows real-time health:
-
-```
-/pool status
-=== codex-pool (enabled) ===
-  openai-codex   -- logged in
-  openai-codex-2 -- logged in (rate limited, cooling down)
-  openai-codex-3 -- logged in
-```
 
 ## Supported providers
 
@@ -95,43 +128,18 @@ Pool status shows real-time health:
 
 ## Environment variable (optional)
 
-For scripting, set `MULTI_SUB` instead of using the TUI:
-
 ```bash
 export MULTI_SUB="openai-codex:2,anthropic:1"
 ```
 
-Env entries merge with saved config (no duplicates).
+Env entries merge with saved config.
 
-## Config file
+## Config files
 
-`~/.pi/agent/multi-pass.json`:
-
-```json
-{
-  "subscriptions": [
-    { "provider": "openai-codex", "index": 2, "label": "work" },
-    { "provider": "openai-codex", "index": 3, "label": "personal" },
-    { "provider": "anthropic", "index": 2 }
-  ],
-  "pools": [
-    {
-      "name": "codex-pool",
-      "baseProvider": "openai-codex",
-      "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
-      "enabled": true
-    }
-  ]
-}
-```
-
-## How it works
-
-- Each subscription registers a new provider (e.g., `anthropic-2`) with its own OAuth flow
-- Models are cloned dynamically via `getModels()` -- new models from pi updates appear automatically
-- Pools listen to `agent_end` events, detect rate limit errors, and call `setModel()` + `sendUserMessage()` to retry
-- Exhausted members have a 5-minute cooldown before re-entering rotation
-- All state persisted to `multi-pass.json`; pool exhaustion state is in-memory only
+| File | Scope | Contains |
+|---|---|---|
+| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + default pools |
+| `.pi/multi-pass.json` | Project | Pool overrides + sub restrictions |
 
 ## License
 

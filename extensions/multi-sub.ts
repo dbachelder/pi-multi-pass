@@ -7,6 +7,7 @@
  * Features:
  *   - /subs: manage subscriptions (add, remove, login, logout, status)
  *   - /pool: define provider pools with auto-rotation on rate limit errors
+ *   - Project-level pool config: .pi/multi-pass.json overrides global pools
  *   - MULTI_SUB env var for scripting
  *
  * Pool auto-rotation: group subscriptions into pools. When the active sub
@@ -14,7 +15,14 @@
  * sub in the pool and retry. Keeps the same model ID, just rotates the
  * provider/account.
  *
- * Config file: ~/.pi/agent/multi-pass.json
+ * Config files:
+ *   Global:  ~/.pi/agent/multi-pass.json  (subscriptions + default pools)
+ *   Project: .pi/multi-pass.json          (pool overrides + subscription filtering)
+ *
+ * Project-level config can:
+ *   - Define project-specific pools (override global pools)
+ *   - Restrict which subscriptions are usable via "allowedSubs"
+ *   - Leave pools empty to inherit global pools
  *
  * Supported providers:
  *   - anthropic          (Claude Pro/Max)
@@ -245,12 +253,34 @@ interface MultiPassConfig {
 	pools: PoolConfig[];
 }
 
-function configPath(): string {
+/** Project-level config (.pi/multi-pass.json) */
+interface ProjectConfig {
+	/** Override pools for this project. If set, replaces global pools. */
+	pools?: PoolConfig[];
+	/** Restrict which subscriptions can be used. Provider names (e.g. "openai-codex-2").
+	 *  If set, only these subs (plus the originals) are available in this project.
+	 *  If not set, all global subs are available. */
+	allowedSubs?: string[];
+}
+
+/** Effective config after merging global + project */
+interface EffectiveConfig {
+	subscriptions: SubEntry[];
+	pools: PoolConfig[];
+	/** Which project config was loaded from, if any */
+	projectConfigPath?: string;
+}
+
+function globalConfigPath(): string {
 	return join(getAgentDir(), "multi-pass.json");
 }
 
-function loadConfig(): MultiPassConfig {
-	const path = configPath();
+function projectConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "multi-pass.json");
+}
+
+function loadGlobalConfig(): MultiPassConfig {
+	const path = globalConfigPath();
 	if (!existsSync(path)) return { subscriptions: [], pools: [] };
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8"));
@@ -263,8 +293,50 @@ function loadConfig(): MultiPassConfig {
 	}
 }
 
-function saveConfig(config: MultiPassConfig): void {
-	const path = configPath();
+function loadProjectConfig(cwd: string): ProjectConfig | undefined {
+	const path = projectConfigPath(cwd);
+	if (!existsSync(path)) return undefined;
+	try {
+		return JSON.parse(readFileSync(path, "utf-8")) as ProjectConfig;
+	} catch {
+		return undefined;
+	}
+}
+
+function loadEffectiveConfig(cwd: string): EffectiveConfig {
+	const global = loadGlobalConfig();
+	const project = loadProjectConfig(cwd);
+
+	if (!project) {
+		return { subscriptions: global.subscriptions, pools: global.pools };
+	}
+
+	// Subscriptions are always global, but filter if allowedSubs is set
+	let subs = global.subscriptions;
+	if (project.allowedSubs && project.allowedSubs.length > 0) {
+		const allowed = new Set(project.allowedSubs);
+		subs = global.subscriptions.filter((s) => allowed.has(subProviderName(s)));
+	}
+
+	// Pools: project overrides global if defined
+	const pools = project.pools !== undefined ? project.pools : global.pools;
+
+	return {
+		subscriptions: subs,
+		pools,
+		projectConfigPath: projectConfigPath(cwd),
+	};
+}
+
+function saveGlobalConfig(config: MultiPassConfig): void {
+	const path = globalConfigPath();
+	const dir = dirname(path);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+}
+
+function saveProjectConfig(cwd: string, config: ProjectConfig): void {
+	const path = projectConfigPath(cwd);
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
@@ -652,7 +724,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 
 	const label = await ctx.ui.input("Label (optional)", "e.g. work, personal");
 
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allEntries = normalizeEntries(mergeConfigs(config, envEntries));
 	const usedIndices = new Set(
@@ -668,7 +740,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	};
 
 	config.subscriptions.push(entry);
-	saveConfig(config);
+	saveGlobalConfig(config);
 
 	registerSub(pi, entry);
 	ctx.modelRegistry.refresh();
@@ -689,7 +761,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 }
 
 async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	if (config.subscriptions.length === 0) {
 		ctx.ui.notify("No saved subscriptions to remove.", "info");
 		return;
@@ -729,13 +801,13 @@ async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	config.pools = config.pools.filter((p) => p.members.length > 0);
 
 	config.subscriptions.splice(idx, 1);
-	saveConfig(config);
+	saveGlobalConfig(config);
 	ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
 
 async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
@@ -768,7 +840,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
@@ -795,7 +867,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
@@ -882,7 +954,7 @@ async function handlePoolCreate(
 	const poolName = await ctx.ui.input("Pool name", `e.g. ${baseProvider}-pool`);
 	if (!poolName?.trim()) return;
 
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 
@@ -971,7 +1043,7 @@ async function handlePoolCreate(
 		config.pools.push(pool);
 	}
 
-	saveConfig(config);
+	saveGlobalConfig(config);
 	poolManager.loadPools(config.pools);
 
 	ctx.ui.notify(
@@ -984,7 +1056,7 @@ async function handlePoolList(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const pools = config.pools;
 
 	if (pools.length === 0) {
@@ -1007,7 +1079,7 @@ async function handlePoolToggle(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	if (config.pools.length === 0) {
 		ctx.ui.notify("No pools configured.", "info");
 		return;
@@ -1024,7 +1096,7 @@ async function handlePoolToggle(
 	if (idx < 0) return;
 
 	config.pools[idx].enabled = !config.pools[idx].enabled;
-	saveConfig(config);
+	saveGlobalConfig(config);
 	poolManager.loadPools(config.pools);
 
 	const pool = config.pools[idx];
@@ -1038,7 +1110,7 @@ async function handlePoolRemove(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	if (config.pools.length === 0) {
 		ctx.ui.notify("No pools configured.", "info");
 		return;
@@ -1062,7 +1134,7 @@ async function handlePoolRemove(
 	if (!confirmed) return;
 
 	config.pools.splice(idx, 1);
-	saveConfig(config);
+	saveGlobalConfig(config);
 	poolManager.loadPools(config.pools);
 	ctx.ui.notify(`Removed pool "${pool.name}"`, "info");
 }
@@ -1071,7 +1143,7 @@ async function handlePoolStatus(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	if (config.pools.length === 0) {
 		ctx.ui.notify("No pools configured.", "info");
 		return;
@@ -1094,6 +1166,221 @@ async function handlePoolStatus(
 	await ctx.ui.select("Pool Status", lines);
 }
 
+async function handlePoolProject(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+): Promise<void> {
+	const projectPath = projectConfigPath(ctx.cwd);
+	const projectConf = loadProjectConfig(ctx.cwd);
+	const globalConf = loadGlobalConfig();
+
+	const hasProjectConfig = projectConf !== undefined;
+
+	const actions: string[] = [];
+	if (hasProjectConfig) {
+		actions.push(`edit     -- Edit project pool config (${projectPath})`);
+		actions.push("clear    -- Remove project config (use global pools)");
+	}
+	actions.push("restrict -- Set allowed subs for this project");
+	actions.push("pools    -- Set project-specific pools");
+	actions.push("info     -- Show effective config for this project");
+
+	const selected = await ctx.ui.select(
+		`Project Config (${hasProjectConfig ? "active" : "none"})`,
+		actions,
+	);
+	if (!selected) return;
+
+	const action = selected.split(" ")[0].trim();
+
+	if (action === "clear") {
+		if (!hasProjectConfig) {
+			ctx.ui.notify("No project config to clear.", "info");
+			return;
+		}
+		const confirmed = await ctx.ui.confirm(
+			"Clear project config",
+			`Remove ${projectPath}?\nGlobal pools will be used instead.`,
+		);
+		if (!confirmed) return;
+		try {
+			writeFileSync(projectPath, "{}", "utf-8");
+			const effective = loadEffectiveConfig(ctx.cwd);
+			poolManager.loadPools(effective.pools);
+			ctx.ui.notify("Project config cleared. Using global pools.", "info");
+		} catch (err: unknown) {
+			ctx.ui.notify(`Failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+		}
+		return;
+	}
+
+	if (action === "restrict") {
+		// Show all global subs and let user pick which are allowed
+		const envEntries = parseEnvConfig();
+		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
+		const allProviderNames = [
+			...SUPPORTED_PROVIDERS.filter((p) =>
+				ctx.modelRegistry.authStorage.hasAuth(p),
+			),
+			...allSubs.map((s) => subProviderName(s)),
+		];
+
+		if (allProviderNames.length === 0) {
+			ctx.ui.notify("No subscriptions available to restrict.", "info");
+			return;
+		}
+
+		const currentAllowed = projectConf?.allowedSubs || [];
+		const allowed: string[] = [];
+		let selecting = true;
+
+		while (selecting) {
+			const remaining = allProviderNames.filter((p) => !allowed.includes(p));
+			if (remaining.length === 0) break;
+
+			const options = [
+				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
+				...remaining.map((p) => {
+					const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
+					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
+				}),
+				"[Done - save]",
+				"[Clear - allow all]",
+			];
+
+			const picked = await ctx.ui.select("Select allowed subs (Esc when done)", options);
+			if (!picked || picked.startsWith("---")) {
+				selecting = false;
+				continue;
+			}
+			if (picked === "[Done - save]") {
+				selecting = false;
+				continue;
+			}
+			if (picked === "[Clear - allow all]") {
+				allowed.length = 0;
+				selecting = false;
+				continue;
+			}
+
+			const provName = picked.split(" ")[0];
+			if (provName && allProviderNames.includes(provName)) {
+				allowed.push(provName);
+			}
+		}
+
+		const newProjectConf: ProjectConfig = {
+			...projectConf,
+			allowedSubs: allowed.length > 0 ? allowed : undefined,
+		};
+		saveProjectConfig(ctx.cwd, newProjectConf);
+
+		const effective = loadEffectiveConfig(ctx.cwd);
+		poolManager.loadPools(effective.pools);
+
+		if (allowed.length > 0) {
+			ctx.ui.notify(
+				`Project restricted to: ${allowed.join(", ")}`,
+				"info",
+			);
+		} else {
+			ctx.ui.notify("Project restriction cleared. All subs available.", "info");
+		}
+		return;
+	}
+
+	if (action === "pools") {
+		// Copy global pools and let user toggle which are active for this project
+		const globalPools = globalConf.pools;
+		if (globalPools.length === 0) {
+			ctx.ui.notify("No global pools defined. Create pools first with /pool create.", "info");
+			return;
+		}
+
+		const currentProjectPools = projectConf?.pools;
+		const options = [
+			"[Use global pools (no override)]",
+			...globalPools.map((p) => {
+				const isIncluded = currentProjectPools
+					? currentProjectPools.some((pp) => pp.name === p.name)
+					: true;
+				return `${p.name} (${p.members.length} members) ${isIncluded ? "[included]" : "[excluded]"}`;
+			}),
+		];
+
+		const selected2 = await ctx.ui.select("Project pools (select to toggle)", options);
+		if (!selected2) return;
+
+		if (selected2 === "[Use global pools (no override)]") {
+			const newProjectConf: ProjectConfig = { ...projectConf };
+			delete newProjectConf.pools;
+			saveProjectConfig(ctx.cwd, newProjectConf);
+			const effective = loadEffectiveConfig(ctx.cwd);
+			poolManager.loadPools(effective.pools);
+			ctx.ui.notify("Project will use global pools.", "info");
+			return;
+		}
+
+		// Toggle: build project pool list
+		const poolName = selected2.split(" (")[0];
+		const pool = globalPools.find((p) => p.name === poolName);
+		if (!pool) return;
+
+		let projectPools = currentProjectPools ? [...currentProjectPools] : [...globalPools];
+		const existingIdx = projectPools.findIndex((p) => p.name === pool.name);
+		if (existingIdx >= 0) {
+			projectPools.splice(existingIdx, 1);
+		} else {
+			projectPools.push(pool);
+		}
+
+		const newProjectConf: ProjectConfig = { ...projectConf, pools: projectPools };
+		saveProjectConfig(ctx.cwd, newProjectConf);
+		const effective = loadEffectiveConfig(ctx.cwd);
+		poolManager.loadPools(effective.pools);
+
+		const activeNames = projectPools.map((p) => p.name).join(", ") || "none";
+		ctx.ui.notify(`Project pools: ${activeNames}`, "info");
+		return;
+	}
+
+	if (action === "info") {
+		const effective = loadEffectiveConfig(ctx.cwd);
+		const lines: string[] = [];
+
+		if (effective.projectConfigPath && loadProjectConfig(ctx.cwd)) {
+			lines.push(`Project config: ${projectPath}`);
+		} else {
+			lines.push("Project config: none (using global)");
+		}
+
+		const pc = loadProjectConfig(ctx.cwd);
+		if (pc?.allowedSubs && pc.allowedSubs.length > 0) {
+			lines.push(`Allowed subs: ${pc.allowedSubs.join(", ")}`);
+		} else {
+			lines.push("Allowed subs: all (no restriction)");
+		}
+
+		lines.push("");
+		lines.push(`Effective pools (${effective.pools.length}):`);
+		for (const pool of effective.pools) {
+			const src = pc?.pools ? "project" : "global";
+			lines.push(`  ${pool.name} [${src}] -- ${pool.members.join(", ")} (${pool.enabled ? "enabled" : "disabled"})`);
+		}
+
+		lines.push("");
+		lines.push(`Effective subs (${effective.subscriptions.length}):`);
+		for (const sub of effective.subscriptions) {
+			const authed = ctx.modelRegistry.authStorage.hasAuth(subProviderName(sub));
+			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
+		}
+
+		await ctx.ui.select("Effective Config", lines);
+		return;
+	}
+}
+
 async function handlePoolMenu(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
@@ -1104,6 +1391,7 @@ async function handlePoolMenu(
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
+		"project  -- Project-level pool config (.pi/multi-pass.json)",
 	];
 
 	const selected = await ctx.ui.select("Pool Manager", actions);
@@ -1121,6 +1409,8 @@ async function handlePoolMenu(
 			return handlePoolRemove(ctx, poolManager);
 		case "status":
 			return handlePoolStatus(ctx, poolManager);
+		case "project":
+			return handlePoolProject(ctx, poolManager);
 	}
 }
 
@@ -1146,7 +1436,7 @@ async function handleSubsMenu(
 	if (!selected) return;
 
 	const action = selected.split(" ")[0].trim();
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	switch (action) {
 		case "list":
 			return handleSubsList(ctx, config);
@@ -1168,18 +1458,36 @@ async function handleSubsMenu(
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
-	const config = loadConfig();
+	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
-	// Register all subscriptions
+	// Register all subscriptions (always global)
 	for (const entry of all) {
 		registerSub(pi, entry);
 	}
 
-	// Initialize pool manager
+	// Initialize pool manager with global pools (updated on session_start with project config)
 	const poolManager = new PoolManager(pi);
 	poolManager.loadPools(config.pools);
+
+	// On session start, reload pools with project-level config
+	pi.on("session_start", async (_event, ctx) => {
+		const effective = loadEffectiveConfig(ctx.cwd);
+		poolManager.loadPools(effective.pools);
+
+		const projectConf = loadProjectConfig(ctx.cwd);
+		if (projectConf) {
+			const poolCount = effective.pools.filter((p) => p.enabled).length;
+			const restricted = projectConf.allowedSubs && projectConf.allowedSubs.length > 0;
+			const parts: string[] = [];
+			if (poolCount > 0) parts.push(`${poolCount} pool(s)`);
+			if (restricted) parts.push(`restricted to ${projectConf.allowedSubs!.length} sub(s)`);
+			if (parts.length > 0) {
+				ctx.ui.setStatus("multi-pass", `project: ${parts.join(", ")}`);
+			}
+		}
+	});
 
 	// Track last user prompt for retry on rotation
 	let lastUserPrompt: string | null = null;
@@ -1239,7 +1547,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const config = loadConfig();
+			const config = loadGlobalConfig();
 			const subcommand = args.trim().toLowerCase();
 			switch (subcommand) {
 				case "list":
@@ -1269,7 +1577,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("pool", {
 		description: "Manage subscription rotation pools",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "toggle", "remove", "status"];
+			const subcommands = ["create", "list", "toggle", "remove", "status", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -1293,6 +1601,8 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handlePoolStatus(ctx, poolManager);
+				case "project":
+					return handlePoolProject(ctx, poolManager);
 				default:
 					return handlePoolMenu(ctx, poolManager);
 			}
